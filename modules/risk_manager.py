@@ -283,6 +283,9 @@ class RiskManager:
         if not USE_TAKE_PROFIT:
             return None
             
+        # Special handling for high volatility tokens
+        is_high_volatility = symbol[-4:] in ["USDT"] and any(token in symbol[:-4] for token in ["SOL", "RAY", "ARB", "DOGE", "SHIB"])
+            
         # Choose take profit percentage based on market condition
         if self.current_market_condition in ['BULLISH', 'EXTREME_BULLISH']:
             take_profit_pct = TAKE_PROFIT_PCT_BULLISH
@@ -292,6 +295,12 @@ class RiskManager:
             take_profit_pct = TAKE_PROFIT_PCT_SIDEWAYS
         else:
             take_profit_pct = TAKE_PROFIT_PCT  # Default
+            
+        # For high volatility tokens, make take profit more aggressive
+        if is_high_volatility:
+            original_pct = take_profit_pct
+            take_profit_pct = take_profit_pct * 1.2  # 20% wider take profit for high volatility tokens
+            logger.info(f"High volatility token detected: Increasing take profit percentage from {original_pct*100:.2f}% to {take_profit_pct*100:.2f}%")
             
         if side == "BUY":  # Long position
             take_profit_price = entry_price * (1 + take_profit_pct)
@@ -304,7 +313,10 @@ class RiskManager:
             price_precision = symbol_info['price_precision']
             take_profit_price = round(take_profit_price, price_precision)
             
-        logger.info(f"Calculated {self.current_market_condition} take profit at {take_profit_price} ({take_profit_pct*100:.2f}%)")
+        if is_high_volatility:
+            logger.info(f"Calculated high-volatility {self.current_market_condition} take profit at {take_profit_price} ({take_profit_pct*100:.2f}%, enhanced setting active)")
+        else:
+            logger.info(f"Calculated {self.current_market_condition} take profit at {take_profit_price} ({take_profit_pct*100:.2f}%)")
         
         # Store the take profit level for this symbol
         self.take_profit_levels[symbol] = take_profit_price
@@ -313,35 +325,36 @@ class RiskManager:
         
     def adjust_stop_loss_for_trailing(self, symbol, side, current_price, position_info=None):
         """
-        Adjust stop loss for trailing stop if needed
+        Adjust stop loss for trailing stop functionality
         
         Args:
             symbol: Trading pair symbol
-            side: Position side ('BUY' or 'SELL')
+            side: 'BUY' or 'SELL'
             current_price: Current market price
-            position_info: Position information dictionary
+            position_info: Optional position info
             
         Returns:
-            new_stop: New stop loss price if it should be adjusted, None otherwise
+            bool: True if stop loss was adjusted, False otherwise
         """
-        if not TRAILING_STOP:
-            return None
+        if not TRAILING_STOP or symbol not in self.stop_loss_levels:
+            return False
             
+        # Check if we need to throttle updates (don't update too frequently)
+        current_time = datetime.now()
+        last_update_time = self.last_trailing_stop_update.get(symbol, None)
+        if last_update_time and (current_time - last_update_time).seconds < STOP_LOSS_UPDATE_INTERVAL_SECONDS:
+            return False  # Don't update too frequently
+            
+        # Get position info if not provided
         if not position_info:
-            # Get position info specifically for this symbol (important for multi-instance mode)
             position_info = self.binance_client.get_position_info(symbol)
-            
-        # Only proceed if we have a valid position for this specific symbol
-        if not position_info or abs(position_info['position_amount']) == 0:
-            return None
-            
-        # Ensure we're dealing with the right symbol in multi-instance mode
-        if position_info['symbol'] != symbol:
-            logger.warning(f"Position symbol mismatch: expected {symbol}, got {position_info['symbol']}")
-            return None
-            
-        entry_price = position_info['entry_price']
+            if not position_info or float(position_info['position_amount']) == 0:
+                return False
         
+        current_stop_loss = self.stop_loss_levels[symbol]
+        if not current_stop_loss:
+            return False
+            
         # Choose trailing stop percentage based on market condition
         if self.current_market_condition in ['BULLISH', 'EXTREME_BULLISH']:
             trailing_stop_pct = TRAILING_STOP_PCT_BULLISH
@@ -352,229 +365,164 @@ class RiskManager:
         else:
             trailing_stop_pct = TRAILING_STOP_PCT  # Default
         
-        # Calculate new stop loss based on current price
+        # Calculate new stop loss level
         if side == "BUY":  # Long position
-            new_stop = current_price * (1 - trailing_stop_pct)
-            # Only move stop loss up, never down
-            current_stop = self.stop_loss_levels.get(symbol) or self.calculate_stop_loss(symbol, side, entry_price)
-            if current_stop and new_stop <= current_stop:
-                logger.debug(f"Not adjusting trailing stop for long position: current ({current_stop}) > calculated ({new_stop})")
-                return None
+            # Only move stop loss up for long positions
+            new_stop_loss = current_price * (1 - trailing_stop_pct)
+            if new_stop_loss <= current_stop_loss:
+                return False  # Don't move stop loss down
         else:  # Short position
-            new_stop = current_price * (1 + trailing_stop_pct)
-            # Only move stop loss down, never up
-            current_stop = self.stop_loss_levels.get(symbol) or self.calculate_stop_loss(symbol, side, entry_price)
-            if current_stop and new_stop >= current_stop:
-                logger.debug(f"Not adjusting trailing stop for short position: current ({current_stop}) < calculated ({new_stop})")
-                return None
+            # Only move stop loss down for short positions
+            new_stop_loss = current_price * (1 + trailing_stop_pct)
+            if new_stop_loss >= current_stop_loss:
+                return False  # Don't move stop loss up
                 
         # Apply price precision
         symbol_info = self.binance_client.get_symbol_info(symbol)
         if symbol_info:
             price_precision = symbol_info['price_precision']
-            new_stop = round(new_stop, price_precision)
-        
-        # Check if this is a significant move (at least 0.1% change) or if we haven't updated in a while
-        last_update_time = self.last_trailing_stop_update.get(symbol, datetime.min)
-        significant_move = (abs(new_stop - current_stop) / current_stop > 0.001)
-        time_since_update = (datetime.now() - last_update_time).total_seconds()
-        
-        if significant_move or time_since_update > 300:  # 5 minutes
-            logger.info(f"Adjusted {self.current_market_condition} trailing stop loss to {new_stop} ({trailing_stop_pct*100:.2f}%)")
-            logger.info(f"Current price: {current_price}, Entry price: {entry_price}, Stop loss moved: {current_stop} -> {new_stop}")
+            new_stop_loss = round(new_stop_loss, price_precision)
             
-            # Update the stop loss level for this symbol
-            self.stop_loss_levels[symbol] = new_stop
-            self.last_trailing_stop_update[symbol] = datetime.now()
-            
-            return new_stop
-        else:
-            logger.debug(f"Skipping minor trailing stop update (last update: {time_since_update:.1f}s ago)")
-            return None
+        # Update the trailing stop
+        logger.info(f"Updating trailing stop for {symbol} from {current_stop_loss} to {new_stop_loss}")
+        self.stop_loss_levels[symbol] = new_stop_loss
+        self.last_trailing_stop_update[symbol] = current_time
         
+        # Update the actual stop loss order
+        try:
+            success = self.binance_client.update_stop_loss(symbol, new_stop_loss)
+            if success:
+                logger.info(f"Successfully updated trailing stop for {symbol} to {new_stop_loss}")
+                return True
+            else:
+                logger.warning(f"Failed to update trailing stop for {symbol}")
+                return False
+        except Exception as e:
+            logger.error(f"Error updating trailing stop: {e}")
+            return False
+    
     def adjust_take_profit_for_trailing(self, symbol, side, current_price, position_info=None):
         """
-        Adjust take profit price based on trailing settings
+        Adjust take profit for trailing take profit functionality
         
         Args:
             symbol: Trading pair symbol
-            side: Position side ('BUY' or 'SELL')
+            side: 'BUY' or 'SELL'
             current_price: Current market price
-            position_info: Position information including entry_price
+            position_info: Optional position info
             
         Returns:
-            new_take_profit: New take profit price if it should be adjusted, None otherwise
+            bool: True if take profit was adjusted, False otherwise
         """
-        if not USE_TAKE_PROFIT or not TRAILING_TAKE_PROFIT:
-            return None
+        if not TRAILING_TAKE_PROFIT or symbol not in self.take_profit_levels:
+            return False
             
+        # Check if we need to throttle updates (don't update too frequently)
+        current_time = datetime.now()
+        last_update_time = self.last_trailing_tp_update.get(symbol, None)
+        if last_update_time and (current_time - last_update_time).seconds < TAKE_PROFIT_UPDATE_INTERVAL_SECONDS:
+            return False  # Don't update too frequently
+            
+        # Get position info if not provided
         if not position_info:
             position_info = self.binance_client.get_position_info(symbol)
-            
-        if not position_info or abs(position_info['position_amount']) == 0:
-            return None
-            
-        entry_price = float(position_info.get('entry_price', 0))
-        if entry_price <= 0:
-            return None
+            if not position_info or float(position_info['position_amount']) == 0:
+                return False
         
-        # Get symbol info for precision
-        symbol_info = self.binance_client.get_symbol_info(symbol)
-        if not symbol_info:
-            return None
+        current_take_profit = self.take_profit_levels[symbol]
+        if not current_take_profit:
+            return False
             
-        price_precision = symbol_info.get('price_precision', 2)
-        
         # Choose trailing take profit percentage based on market condition
         if self.current_market_condition in ['BULLISH', 'EXTREME_BULLISH']:
-            trailing_take_profit_pct = TRAILING_TAKE_PROFIT_PCT_BULLISH
+            trailing_tp_pct = TRAILING_TAKE_PROFIT_PCT_BULLISH
         elif self.current_market_condition in ['BEARISH', 'EXTREME_BEARISH']:
-            trailing_take_profit_pct = TRAILING_TAKE_PROFIT_PCT_BEARISH
+            trailing_tp_pct = TRAILING_TAKE_PROFIT_PCT_BEARISH
         elif self.current_market_condition == 'SIDEWAYS':
-            trailing_take_profit_pct = TRAILING_TAKE_PROFIT_PCT_SIDEWAYS
+            trailing_tp_pct = TRAILING_TAKE_PROFIT_PCT_SIDEWAYS
         else:
-            trailing_take_profit_pct = TRAILING_TAKE_PROFIT_PCT  # Default
+            trailing_tp_pct = TRAILING_TAKE_PROFIT_PCT  # Default
         
-        # Calculate the current dynamic take profit level based on the current price
-        if side == 'BUY':  # Long position
-            # For long positions, we want take profit to trail above the price
-            current_take_profit = current_price * (1 + trailing_take_profit_pct)
-            current_take_profit = math.floor(current_take_profit * 10**price_precision) / 10**price_precision
-            
-            # Check if there are open orders specifically for this symbol
-            open_orders = self.binance_client.client.futures_get_open_orders(symbol=symbol)
-            
-            # Find the current take profit order if it exists - only for this specific symbol
-            # This is crucial for multi-instance mode to prevent conflicts between different trading pairs
-            existing_take_profit = None
-            for order in open_orders:
-                if (order['symbol'] == symbol and 
-                    order['type'] == 'TAKE_PROFIT_MARKET' and 
-                    order['side'] == 'SELL'):
-                    existing_take_profit = float(order['stopPrice'])
-                    break
-            
-            # If no existing take profit, use the stored value or calculate a new one
-            if not existing_take_profit:
-                existing_take_profit = self.take_profit_levels.get(symbol) or self.calculate_take_profit(symbol, side, entry_price)
-            
-            # If no existing take profit or our new one is better (higher for long), return the new one
-            if not existing_take_profit:
-                logger.info(f"Long position: Setting initial {self.current_market_condition} take profit to {current_take_profit} ({trailing_take_profit_pct*100:.2f}%)")
-                logger.info(f"Current price: {current_price}, Entry price: {entry_price}")
+        # Calculate new take profit level
+        if side == "BUY":  # Long position
+            # Only move take profit up for long positions
+            new_take_profit = current_price * (1 + trailing_tp_pct)
+            if new_take_profit <= current_take_profit:
+                return False  # Don't move take profit down
+        else:  # Short position
+            # Only move take profit down for short positions
+            new_take_profit = current_price * (1 - trailing_tp_pct)
+            if new_take_profit >= current_take_profit:
+                return False  # Don't move take profit up
                 
-                # Update the take profit level for this symbol
-                self.take_profit_levels[symbol] = current_take_profit
-                self.last_trailing_tp_update[symbol] = datetime.now()
-                
-                return current_take_profit
-            elif current_take_profit > existing_take_profit:
-                # Check if this is a significant move or if we haven't updated in a while
-                last_update_time = self.last_trailing_tp_update.get(symbol, datetime.min)
-                significant_move = (abs(current_take_profit - existing_take_profit) / existing_take_profit > 0.001)
-                time_since_update = (datetime.now() - last_update_time).total_seconds()
-                
-                if significant_move or time_since_update > 300:  # 5 minutes
-                    logger.info(f"Long position: Adjusting {self.current_market_condition} take profit from {existing_take_profit} to {current_take_profit} ({trailing_take_profit_pct*100:.2f}%)")
-                    logger.info(f"Current price: {current_price}, Entry price: {entry_price}, Take profit moved: {existing_take_profit} -> {current_take_profit}")
-                    
-                    # Update the take profit level for this symbol
-                    self.take_profit_levels[symbol] = current_take_profit
-                    self.last_trailing_tp_update[symbol] = datetime.now()
-                    
-                    return current_take_profit
-                else:
-                    logger.debug(f"Skipping minor trailing take profit update (last update: {time_since_update:.1f}s ago)")
-                    return None
+        # Apply price precision
+        symbol_info = self.binance_client.get_symbol_info(symbol)
+        if symbol_info:
+            price_precision = symbol_info['price_precision']
+            new_take_profit = round(new_take_profit, price_precision)
+            
+        # Update the trailing take profit
+        logger.info(f"Updating trailing take profit for {symbol} from {current_take_profit} to {new_take_profit}")
+        self.take_profit_levels[symbol] = new_take_profit
+        self.last_trailing_tp_update[symbol] = current_time
+        
+        # Update the actual take profit order
+        try:
+            success = self.binance_client.update_take_profit(symbol, new_take_profit)
+            if success:
+                logger.info(f"Successfully updated trailing take profit for {symbol} to {new_take_profit}")
+                return True
             else:
-                logger.debug(f"Not adjusting trailing take profit for long position: current ({existing_take_profit}) > calculated ({current_take_profit})")
-                return None
-                
-        elif side == 'SELL':  # Short position
-            # For short positions, we want take profit to trail below the price
-            current_take_profit = current_price * (1 - trailing_take_profit_pct)
-            current_take_profit = math.ceil(current_take_profit * 10**price_precision) / 10**price_precision
-            
-            # Check if there are open orders specifically for this symbol
-            open_orders = self.binance_client.client.futures_get_open_orders(symbol=symbol)
-            
-            # Find the current take profit order if it exists - only for this specific symbol
-            # This is crucial for multi-instance mode to prevent conflicts between different trading pairs
-            existing_take_profit = None
-            for order in open_orders:
-                if (order['symbol'] == symbol and
-                    order['type'] == 'TAKE_PROFIT_MARKET' and 
-                    order['side'] == 'BUY'):
-                    existing_take_profit = float(order['stopPrice'])
-                    break
-            
-            # If no existing take profit, use the stored value or calculate a new one
-            if not existing_take_profit:
-                existing_take_profit = self.take_profit_levels.get(symbol) or self.calculate_take_profit(symbol, side, entry_price)
-            
-            # If no existing take profit or our new one is better (lower), return the new one
-            if not existing_take_profit:
-                logger.info(f"Short position: Setting initial {self.current_market_condition} take profit to {current_take_profit} ({trailing_take_profit_pct*100:.2f}%)")
-                logger.info(f"Current price: {current_price}, Entry price: {entry_price}")
-                
-                # Update the take profit level for this symbol
-                self.take_profit_levels[symbol] = current_take_profit
-                self.last_trailing_tp_update[symbol] = datetime.now()
-                
-                return current_take_profit
-            elif current_take_profit < existing_take_profit:
-                # Check if this is a significant move or if we haven't updated in a while
-                last_update_time = self.last_trailing_tp_update.get(symbol, datetime.min)
-                significant_move = (abs(current_take_profit - existing_take_profit) / existing_take_profit > 0.001)
-                time_since_update = (datetime.now() - last_update_time).total_seconds()
-                
-                if significant_move or time_since_update > 300:  # 5 minutes
-                    logger.info(f"Short position: Adjusting {self.current_market_condition} take profit from {existing_take_profit} to {current_take_profit} ({trailing_take_profit_pct*100:.2f}%)")
-                    logger.info(f"Current price: {current_price}, Entry price: {entry_price}, Take profit moved: {existing_take_profit} -> {current_take_profit}")
-                    
-                    # Update the take profit level for this symbol
-                    self.take_profit_levels[symbol] = current_take_profit
-                    self.last_trailing_tp_update[symbol] = datetime.now()
-                    
-                    return current_take_profit
-                else:
-                    logger.debug(f"Skipping minor trailing take profit update (last update: {time_since_update:.1f}s ago)")
-                    return None
-            else:
-                logger.debug(f"Not adjusting trailing take profit for short position: current ({existing_take_profit}) < calculated ({current_take_profit})")
-                return None
-        
-        return None
-        
-    def update_balance_for_compounding(self):
-        """Update balance tracking for auto-compounding"""
-        if not AUTO_COMPOUND:
+                logger.warning(f"Failed to update trailing take profit for {symbol}")
+                return False
+        except Exception as e:
+            logger.error(f"Error updating trailing take profit: {e}")
             return False
+    
+    def update_balance_for_compounding(self):
+        """
+        Update balance tracking for auto-compounding feature
+        This method is called after a profitable trade to adjust risk based on new balance
+        
+        Returns:
+            float: The current account balance
+        """
+        if not AUTO_COMPOUND:
+            return 0.0
             
+        # Get current account balance
         current_balance = self.binance_client.get_account_balance()
         
-        # First time initialization
-        if self.last_known_balance is None:
-            self.last_known_balance = current_balance
+        # Initialize values if not set
+        if self.initial_balance is None:
             self.initial_balance = current_balance
-            return False
-        
+            self.last_known_balance = current_balance
+            return current_balance
+            
+        # Calculate profit since last update
         profit = current_balance - self.last_known_balance
         
         if profit > 0:
-            # We've made profits since last update
+            # Calculate how much to reinvest based on the compound percentage
             reinvest_amount = profit * COMPOUND_REINVEST_PERCENT
-            logger.info(f"Auto-compounding: {reinvest_amount:.2f} USDT from recent {profit:.2f} USDT profit")
+            logger.info(f"Auto-compounding profit: {profit:.2f} USDT, reinvesting {reinvest_amount:.2f} USDT")
             
-            # Update balance after compounding
+            # Update the last known balance
             self.last_known_balance = current_balance
-            return True
             
-        return False
+            # If we've grown substantially, consider adjusting position sizing 
+            if current_balance > self.initial_balance * 1.5:  # 50% growth
+                growth_factor = current_balance / self.initial_balance
+                # Gradually increase position size as account grows, but not too aggressively
+                pos_multiplier = min(1.5, 1.0 + (growth_factor - 1) * 0.5)
+                logger.info(f"Account has grown by {(growth_factor-1)*100:.1f}%, adjusting position size multiplier to {pos_multiplier:.2f}")
+                self.update_position_sizing(pos_multiplier)
+        
+        return current_balance
 
     def calculate_partial_take_profits(self, symbol, side, entry_price):
         """
-        Calculate multiple partial take profit levels based on market condition
+        Calculate partial take profit levels for tiered profit taking
         
         Args:
             symbol: Trading pair symbol
@@ -582,218 +530,173 @@ class RiskManager:
             entry_price: Entry price of the position
             
         Returns:
-            list: List of dictionaries with take profit levels and percentages of position to close
+            list: List of take profit levels with quantity percentages
+                Each item is a dict with 'price' and 'percentage' keys
         """
-        if not USE_TAKE_PROFIT:
-            return []
-            
-        # Choose take profit percentage based on market condition
+        # Define take profit tiers based on market condition
         if self.current_market_condition in ['BULLISH', 'EXTREME_BULLISH']:
-            tp1_pct = TAKE_PROFIT_PCT_BULLISH * 0.5  # 50% of target
-            tp2_pct = TAKE_PROFIT_PCT_BULLISH        # 100% of target
-            tp3_pct = TAKE_PROFIT_PCT_BULLISH * 1.5  # 150% of target
+            # More optimistic targets in bullish markets
+            take_profit_tiers = [
+                {'level': TAKE_PROFIT_PCT_BULLISH * 0.5, 'percentage': 0.3},  # 30% of position at first target
+                {'level': TAKE_PROFIT_PCT_BULLISH, 'percentage': 0.4},        # 40% of position at second target
+                {'level': TAKE_PROFIT_PCT_BULLISH * 2.0, 'percentage': 0.3}   # 30% of position at third target
+            ]
         elif self.current_market_condition in ['BEARISH', 'EXTREME_BEARISH']:
-            tp1_pct = TAKE_PROFIT_PCT_BEARISH * 0.5  # Earlier take profit in bearish market
-            tp2_pct = TAKE_PROFIT_PCT_BEARISH
-            tp3_pct = TAKE_PROFIT_PCT_BEARISH * 1.3  # Only 130% of target in bearish markets
-        elif self.current_market_condition == 'SIDEWAYS':
-            tp1_pct = TAKE_PROFIT_PCT_SIDEWAYS * 0.7  # Take profits quicker in sideways markets
-            tp2_pct = TAKE_PROFIT_PCT_SIDEWAYS
-            tp3_pct = TAKE_PROFIT_PCT_SIDEWAYS * 1.2  # Conservative extension in sideways
-        else:
-            tp1_pct = TAKE_PROFIT_PCT * 0.5
-            tp2_pct = TAKE_PROFIT_PCT
-            tp3_pct = TAKE_PROFIT_PCT * 1.5
-        
-        # Get symbol info for price precision
-        symbol_info = self.binance_client.get_symbol_info(symbol)
-        price_precision = 2  # Default
-        if symbol_info:
-            price_precision = symbol_info.get('price_precision', 2)
-        
-        # Calculate take profit prices
-        if side == "BUY":  # Long position
-            tp1_price = round(entry_price * (1 + tp1_pct), price_precision)
-            tp2_price = round(entry_price * (1 + tp2_pct), price_precision)
-            tp3_price = round(entry_price * (1 + tp3_pct), price_precision)
-        else:  # Short position
-            tp1_price = round(entry_price * (1 - tp1_pct), price_precision)
-            tp2_price = round(entry_price * (1 - tp2_pct), price_precision)
-            tp3_price = round(entry_price * (1 - tp3_pct), price_precision)
-        
-        # Define partial take profit levels with % of position to close at each level
-        take_profits = [
-            {'price': tp1_price, 'percentage': 0.3, 'pct_from_entry': tp1_pct * 100},  # Close 30% at first TP
-            {'price': tp2_price, 'percentage': 0.4, 'pct_from_entry': tp2_pct * 100},  # Close 40% at second TP
-            {'price': tp3_price, 'percentage': 0.3, 'pct_from_entry': tp3_pct * 100}   # Close 30% at third TP
-        ]
-        
-        logger.info(f"Calculated {self.current_market_condition} partial take profits: "
-                   f"TP1: {tp1_price} ({tp1_pct*100:.2f}%), "
-                   f"TP2: {tp2_price} ({tp2_pct*100:.2f}%), "
-                   f"TP3: {tp3_price} ({tp3_pct*100:.2f}%)")
-                   
-        return take_profits
+            # More conservative targets in bearish markets
+            take_profit_tiers = [
+                {'level': TAKE_PROFIT_PCT_BEARISH * 0.7, 'percentage': 0.4},  # 40% of position at first target
+                {'level': TAKE_PROFIT_PCT_BEARISH, 'percentage': 0.4},        # 40% of position at second target
+                {'level': TAKE_PROFIT_PCT_BEARISH * 1.5, 'percentage': 0.2}   # 20% of position at third target
+            ]
+        else:  # SIDEWAYS or default
+            # Balanced targets in sideways markets
+            take_profit_tiers = [
+                {'level': TAKE_PROFIT_PCT_SIDEWAYS * 0.6, 'percentage': 0.3},  # 30% of position at first target
+                {'level': TAKE_PROFIT_PCT_SIDEWAYS, 'percentage': 0.5},        # 50% of position at second target
+                {'level': TAKE_PROFIT_PCT_SIDEWAYS * 1.7, 'percentage': 0.2}   # 20% of position at third target
+            ]
+            
+        # Calculate price levels
+        tp_levels = []
+        for tier in take_profit_tiers:
+            if side == "BUY":  # Long position
+                price = entry_price * (1 + tier['level'])
+            else:  # Short position
+                price = entry_price * (1 - tier['level'])
+                
+            # Apply price precision
+            symbol_info = self.binance_client.get_symbol_info(symbol)
+            if symbol_info:
+                price_precision = symbol_info['price_precision']
+                price = round(price, price_precision)
+                
+            tp_levels.append({
+                'price': price,
+                'percentage': tier['percentage']
+            })
+            
+        logger.info(f"Calculated partial take profit levels for {symbol} ({self.current_market_condition} market):")
+        for i, level in enumerate(tp_levels):
+            logger.info(f"   TP {i+1}: {level['price']} ({level['percentage']*100:.0f}% of position)")
+            
+        return tp_levels
         
     def calculate_volatility_based_stop_loss(self, symbol, side, entry_price, klines=None):
         """
-        Calculate stop loss based on volatility (ATR) rather than fixed percentage
+        Calculate stop loss based on historical volatility (ATR)
         
         Args:
             symbol: Trading pair symbol
             side: 'BUY' or 'SELL'
-            entry_price: Entry price
-            klines: Optional recent price data for ATR calculation
+            entry_price: Entry price of the position
+            klines: Optional klines data for ATR calculation
             
         Returns:
-            float: Volatility-adjusted stop loss price
+            float: Stop loss price
         """
-        if not USE_STOP_LOSS:
-            return None
+        # Default ATR multipliers based on market condition
+        if self.current_market_condition in ['BULLISH', 'EXTREME_BULLISH']:
+            atr_multiplier = 2.0  # More room in bullish markets
+        elif self.current_market_condition in ['BEARISH', 'EXTREME_BEARISH']:
+            atr_multiplier = 1.5  # Tighter stops in bearish markets
+        elif self.current_market_condition == 'SIDEWAYS':
+            atr_multiplier = 1.8  # Medium stops in sideways markets
+        else:
+            atr_multiplier = 1.7  # Default
             
-        # If no klines provided, use default percentage-based stop loss
-        if klines is None or len(klines) < 14:
+        # If we don't have klines data, fetch it
+        if klines is None:
+            from modules.config import TIMEFRAME
+            klines = self.binance_client.get_historical_klines(symbol, TIMEFRAME, "1 day ago")
+            
+        # If we still don't have data, use the regular percentage-based stop loss
+        if not klines or len(klines) < 15:
+            logger.warning(f"Insufficient data for volatility-based stop loss. Using regular stop loss instead.")
             return self.calculate_stop_loss(symbol, side, entry_price)
+            
+        # Calculate ATR
+        import pandas as pd
+        import ta
+        
+        # Convert klines to dataframe
+        df = pd.DataFrame(klines, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        
+        # Convert string values to numeric
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col])
+            
+        # Calculate ATR with a 14-period window
+        df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
+        
+        # Get the latest ATR value
+        latest_atr = df['atr'].iloc[-1]
         
         # Special handling for high volatility tokens
         is_high_volatility = symbol[-4:] in ["USDT"] and any(token in symbol[:-4] for token in ["SOL", "RAY", "ARB", "DOGE", "SHIB"])
+        if is_high_volatility:
+            atr_multiplier *= 1.3  # 30% wider for high volatility tokens
             
-        try:
-            # Convert klines to dataframe for ATR calculation
-            df = pd.DataFrame(klines, columns=[
-                'open_time', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
+        # Calculate stop loss price
+        if side == "BUY":  # Long position
+            stop_loss = entry_price - (latest_atr * atr_multiplier)
+        else:  # Short position
+            stop_loss = entry_price + (latest_atr * atr_multiplier)
             
-            # Convert string values to numeric
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col])
-                
-            # Calculate ATR
-            atr_period = 14
-            if len(df) >= atr_period:
-                # Use ta library ATR
-                atr = ta.volatility.average_true_range(
-                    df['high'], df['low'], df['close'], window=atr_period
-                ).iloc[-1]
-                
-                # Calculate ATR as percentage of price
-                atr_pct = atr / entry_price
-                
-                # Base multiplier on market condition
-                if self.current_market_condition in ['BULLISH', 'EXTREME_BULLISH']:
-                    atr_multiplier = 2.0  # Wider stops in bullish trend
-                elif self.current_market_condition in ['BEARISH', 'EXTREME_BEARISH']:
-                    atr_multiplier = 1.5  # Medium stops in bearish trend
-                else:  # SIDEWAYS or SQUEEZE
-                    atr_multiplier = 1.0  # Tighter stops in sideways market
-                
-                # Apply high volatility token specific adjustments - increase multiplier by 50%
-                if is_high_volatility:
-                    original_multiplier = atr_multiplier
-                    atr_multiplier = atr_multiplier * 1.5
-                    logger.info(f"High volatility token detected: Increasing ATR multiplier from {original_multiplier} to {atr_multiplier}")
-                
-                # Calculate stop loss price - use ATR * multiplier but cap it
-                if side == "BUY":  # Long
-                    # Cap maximum stop distance to standard percentage stop loss
-                    max_stop_distance = entry_price * STOP_LOSS_PCT * 1.5  # Allow 50% more than standard
-                    # For high volatility tokens, increase the maximum stop distance by 50%
-                    if is_high_volatility:
-                        max_stop_distance = max_stop_distance * 1.5
-                    atr_stop_distance = min(atr * atr_multiplier, max_stop_distance)
-                    stop_price = entry_price - atr_stop_distance
-                else:  # Short
-                    max_stop_distance = entry_price * STOP_LOSS_PCT * 1.5  # Allow 50% more than standard
-                    # For high volatility tokens, increase the maximum stop distance by 50%
-                    if is_high_volatility:
-                        max_stop_distance = max_stop_distance * 1.5
-                    atr_stop_distance = min(atr * atr_multiplier, max_stop_distance)
-                    stop_price = entry_price + atr_stop_distance
-                
-                # Apply price precision
-                symbol_info = self.binance_client.get_symbol_info(symbol)
-                if symbol_info:
-                    price_precision = symbol_info['price_precision']
-                    stop_price = round(stop_price, price_precision)
-                    
-                # Add high volatility token specific buffer information to log
-                if is_high_volatility:
-                    logger.info(f"Calculated high volatility token ATR-based stop loss at {stop_price} "
-                              f"(ATR: {atr:.6f}, {atr_pct*100:.2f}% of price, "
-                              f"Multiplier: {atr_multiplier}, Enhanced buffer active)")
-                else:
-                    logger.info(f"Calculated ATR-based stop loss at {stop_price} "
-                              f"(ATR: {atr:.6f}, {atr_pct*100:.2f}% of price, "
-                              f"Multiplier: {atr_multiplier})")
-                
-                # Store this stop loss level
-                self.stop_loss_levels[symbol] = stop_price
-                
-                return stop_price
-                
-        except Exception as e:
-            logger.error(f"Error calculating volatility-based stop loss: {e}")
+        # Apply price precision
+        symbol_info = self.binance_client.get_symbol_info(symbol)
+        if symbol_info:
+            price_precision = symbol_info['price_precision']
+            stop_loss = round(stop_loss, price_precision)
             
-        # Fall back to standard stop loss if ATR calculation fails
-        return self.calculate_stop_loss(symbol, side, entry_price)
+        logger.info(f"Calculated volatility-based stop loss at {stop_loss} (ATR: {latest_atr:.4f}, multiplier: {atr_multiplier:.1f})")
         
+        # Store the stop loss level
+        self.stop_loss_levels[symbol] = stop_loss
+        
+        return stop_loss
+    
     def check_trailing_stops(self, symbol, current_price):
         """
-        Check and adjust trailing stop and take profit orders for a symbol
+        Check and update trailing stops for an open position
         
         Args:
             symbol: Trading pair symbol
-            current_price: Current price of the asset
+            current_price: Current market price
             
         Returns:
-            dict: Dictionary with updated stop loss and take profit prices
+            dict: Updated status with any changes to stops or take profits
         """
-        updates = {
-            'stop_loss_updated': False,
-            'take_profit_updated': False,
-            'new_stop_loss': None,
-            'new_take_profit': None
+        result = {
+            'trailing_stop_updated': False,
+            'trailing_tp_updated': False
         }
         
         # Get position info
         position_info = self.binance_client.get_position_info(symbol)
-        if not position_info or abs(position_info['position_amount']) == 0:
-            return updates
-        
+        if not position_info or float(position_info['position_amount']) == 0:
+            return result  # No open position
+            
         # Determine position side
-        position_amount = position_info['position_amount']
+        position_amount = float(position_info['position_amount'])
         side = "BUY" if position_amount > 0 else "SELL"
         
-        # Check if trailing stop should be updated
-        if TRAILING_STOP:
-            new_stop = self.adjust_stop_loss_for_trailing(symbol, side, current_price, position_info)
-            if new_stop:
-                updates['stop_loss_updated'] = True
-                updates['new_stop_loss'] = new_stop
-        
-        # Check if trailing take profit should be updated
-        if TRAILING_TAKE_PROFIT:
-            new_tp = self.adjust_take_profit_for_trailing(symbol, side, current_price, position_info)
-            if new_tp:
-                updates['take_profit_updated'] = True
-                updates['new_take_profit'] = new_tp
-                
-        return updates
-
-
-def round_step_size(quantity, step_size):
-    """Round quantity based on step size"""
-    precision = int(round(-math.log10(step_size)))
-    return round(math.floor(quantity * 10**precision) / 10**precision, precision)
-
-
-def get_step_size(min_qty):
-    """Get step size from min_qty"""
-    step_size = min_qty
-    # Handle cases where min_qty is not the step size (common in Binance)
-    if float(min_qty) > 0:
-        step_size = float(min_qty)
-        
-    return step_size
+        # Check for trailing stop updates
+        if TRAILING_STOP and symbol in self.stop_loss_levels:
+            result['trailing_stop_updated'] = self.adjust_stop_loss_for_trailing(
+                symbol, side, current_price, position_info
+            )
+            
+        # Check for trailing take profit updates
+        if TRAILING_TAKE_PROFIT and symbol in self.take_profit_levels:
+            result['trailing_tp_updated'] = self.adjust_take_profit_for_trailing(
+                symbol, side, current_price, position_info
+            )
+            
+        if result['trailing_stop_updated'] or result['trailing_tp_updated']:
+            logger.info(f"Trailing orders updated for {symbol} at price {current_price}")
+            
+        return result

@@ -354,9 +354,14 @@ def initialize_klines_data(timeframe=None):
             return
             
         klines_data[TRADING_SYMBOL] = klines
-        logger.info(f"Initialized historical data with {len(klines)} candles using timeframe {tf}")
+        logger.info(f"Successfully initialized historical data with {len(klines)} candles for {TRADING_SYMBOL}")
+        
+        # Pre-calculate indicators for faster signal generation on startup
+        strategy.add_indicators(strategy.prepare_data(klines))
+        logger.info(f"Pre-calculated technical indicators for {TRADING_SYMBOL}")
     except Exception as e:
-        logger.error(f"Error initializing klines data: {e}")
+        logger.error(f"Error initializing historical klines data: {e}")
+        logger.error(traceback.format_exc())
 
 
 def on_kline_closed(symbol, kline_data):

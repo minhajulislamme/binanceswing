@@ -1033,9 +1033,5 @@ def get_strategy_for_symbol(symbol, strategy_name=None):
                 period=strategy.supertrend_period,
                 multiplier=strategy.supertrend_multiplier * 1.3  # Increase multiplier by 30%
             )
-            strategy.supertrend_indicator = SupertrendIndicator(
-                period=strategy.supertrend_period,
-                multiplier=strategy.supertrend_multiplier * 1.3  # Increase multiplier by 30%
-            )
     
     return strategy
